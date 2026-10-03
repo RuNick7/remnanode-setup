@@ -9,7 +9,7 @@
 3. На сервере под root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/remnanode-setup/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/RuNick7/remnanode-setup/main/install.sh)
 ```
 
 Скрипт откроет редактор: вставьте туда compose из панели (или только `SECRET_KEY=...`), сохраните (`Ctrl+O`, `Enter`, `Ctrl+X`). Затем он спросит домен и сделает всё остальное, а в конце покажет логи ноды (`Ctrl+C` закрывает логи, нода продолжит работать).

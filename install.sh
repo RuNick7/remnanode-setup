@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # remnanode-setup — установка и обслуживание ноды Remnawave на Ubuntu с нуля.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/remnanode-setup/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/RuNick7/remnanode-setup/main/install.sh)
 #   bash install.sh [install|cert|status|update] [опции]          подробно: bash install.sh --help
 #
 # install: ждёт освобождения apt, ставит Docker (с запасным путём для новых Ubuntu), настраивает ядро
