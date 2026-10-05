@@ -10,7 +10,7 @@
 # занятый 80-й порт, и саму ноду (compose из панели + volumes + ротация логов).
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 NODE_DIR="/opt/remnanode"
 COMPOSE="$NODE_DIR/docker-compose.yml"
 NODE_NAME="remnanode"
@@ -195,7 +195,12 @@ preflight_ports() {
   done
   if port_busy tcp 443; then
     who=$(port_owner tcp 443)
-    case "$who" in *rw-core*|*xray*) ;; *) warn "443/tcp занят ($who): инбаунды Xray на 443 не запустятся — в профиле нужны другие порты (или проксирование через этот $who по SNI)" ;; esac
+    case "$who" in
+      *rw-core*|*xray*) ;;
+      *nginx*|*haproxy*) if grep -rqsE '^[^#]*ssl_preread[[:space:]]+on|^[^#]*req\.ssl_sni' /etc/nginx /etc/haproxy; then ok "443/tcp у $who с маршрутизацией по SNI — инбаунды Xray за ним, это нормально"
+        else warn "443/tcp занят ($who) без SNI-маршрутизации: инбаунды Xray на 443 не запустятся — в профиле нужны другие порты (или stream + ssl_preread в $who)"; fi ;;
+      *) warn "443/tcp занят ($who): инбаунды Xray на 443 не запустятся — в профиле нужны другие порты (или проксирование через этот $who по SNI)" ;;
+    esac
   fi
   if port_busy tcp 80; then info "80/tcp занят ($(port_owner tcp 80)) — это не помешает: сертификат продлевается через временное перенаправление"; fi
 }
@@ -217,13 +222,15 @@ reserved_ports() {  # порты сервисов, которые ядро не 
     saved=$(sed -nE 's/^net\.ipv4\.ip_local_reserved_ports *= *//p' "$SYSCTL_FILE")
     for p in ${saved//,/ }; do list+=("$p"); done
   fi
+  saved=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)   # и те, что зарезервировал кто-то другой
+  for p in ${saved//,/ }; do list+=("$p"); done
   printf '%s\n' "${list[@]}" | grep -E '^[0-9]+(-[0-9]+)?$' | sort -n -u | paste -sd, -
 }
 
 write_sysctl() {
   local reserved; reserved=$(reserved_ports)
   write_file "$SYSCTL_FILE" 644 <<EOF
-# remnanode-setup: сеть VPN-ноды. Применяется до /etc/sysctl.conf, так что значения оттуда главнее.
+# remnanode-setup: сеть VPN-ноды. Строки в /etc/sysctl.conf и поздних файлах sysctl.d, которые это перекрывают, скрипт комментирует (копия .bak-remnanode).
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 # Hysteria2/QUIC: quic-go просит UDP-буфер ~7 МБ, по умолчанию ядро даёт 208 КБ
@@ -247,6 +254,39 @@ vm.swappiness = 10
 EOF
 }
 
+sysctl_override_files() {  # файлы, которые применяются после нашего и перекрывают его значения
+  local f
+  for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+    [ -f "$f" ] || continue
+    case "$f" in /etc/sysctl.d/*) [[ $(basename "$f") > $(basename "$SYSCTL_FILE") ]] || continue ;; esac
+    readlink -f "$f"
+  done | sort -u
+}
+
+fix_sysctl_overrides() {  # закомментировать в чужих файлах ключи, которые перекрывают наши (с резервной копией)
+  [ -f "$SYSCTL_FILE" ] || return 0
+  local f key ours theirs keyre lines
+  while IFS= read -r f; do
+    [ "$f" = "$(readlink -f "$SYSCTL_FILE")" ] && continue
+    lines=()
+    while IFS='=' read -r key ours; do
+      key=$(xargs <<<"$key"); ours=$(xargs <<<"$ours")
+      [ "$key" = net.ipv4.ip_local_reserved_ports ] && continue   # их порты уже вошли в наш список
+      keyre=${key//./[./]}
+      theirs=$(sed -nE "s/^[[:space:]]*-?${keyre}[[:space:]]*=[[:space:]]*//p" "$f" | tail -1 | xargs)
+      [ -n "$theirs" ] && [ "$theirs" != "$ours" ] && lines+=("$key")
+    done < <(grep -E '^[a-z]' "$SYSCTL_FILE")
+    [ "${#lines[@]}" -gt 0 ] || continue
+    info "$f перекрывает настройки ноды (${lines[*]}) — комментирую эти строки, копия: $f.bak-remnanode"
+    [ "$DRY_RUN" = 1 ] && continue
+    [ -f "$f.bak-remnanode" ] || cp -a "$f" "$f.bak-remnanode"
+    for key in "${lines[@]}"; do
+      keyre=${key//./[./]}
+      sed -i -E "s/^([[:space:]]*-?${keyre}[[:space:]]*=.*)$/# remnanode-setup: \1/" "$f"
+    done
+  done < <(sysctl_override_files)
+}
+
 apply_sysctl() {
   [ "$DRY_RUN" = 1 ] && return 0
   local out cc qd
@@ -256,7 +296,7 @@ apply_sysctl() {
   sysctl --system >/dev/null 2>&1 || true   # как при загрузке: /etc/sysctl.conf перекрывает наш файл
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')
   qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')
-  if [ "$cc" = bbr ]; then ok "BBR включён (qdisc $qd)"; else warn "congestion control = $cc, а не bbr: его перекрывает /etc/sysctl.conf или файл в /etc/sysctl.d"; fi
+  if [ "$cc" = bbr ]; then ok "BBR включён (qdisc $qd)"; else warn "congestion control = $cc, а не bbr (в ядре нет tcp_bbr или его перекрывает файл вне /etc)"; fi
   ok "резерв портов: $(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null)"
 }
 
@@ -264,6 +304,7 @@ tune_kernel() {
   info "Ядро: BBR, буферы UDP для Hysteria2/QUIC, conntrack, резерв портов сервисов"
   if [ "$IS_CONTAINER" = 1 ]; then warn "контейнерная виртуализация — настройки ядра пропущены"; return 0; fi
   write_sysctl
+  fix_sysctl_overrides
   printf 'tcp_bbr\nnf_conntrack\n' | write_file /etc/modules-load.d/remnanode.conf 644
   printf 'options nf_conntrack hashsize=65536\n' | write_file /etc/modprobe.d/remnanode-conntrack.conf 644
   [ "$DRY_RUN" = 1 ] && return 0
@@ -277,27 +318,36 @@ setup_swap() {
   [ "$SWAP" = 1 ] || return 0
   info "Swap"
   if [ "$IS_CONTAINER" = 1 ]; then warn "в контейнере swap не настроить — пропускаю"; return 0; fi
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -qx /swapfile && ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+    info "/swapfile включён, но не прописан в /etc/fstab — после перезагрузки пропал бы, добавляю"
+    [ "$DRY_RUN" = 1 ] || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+  fi
   if [ -n "$(swapon --show --noheadings 2>/dev/null)" ]; then ok "уже есть: $(swapon --show --noheadings | awk '{print $1" "$3}' | paste -sd' ' -)"; return 0; fi
-  local mem_mb free_mb fstype
+  local mem_mb free_mb fstype size_mb
   mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   if [ "$mem_mb" -ge 8000 ]; then ok "RAM ${mem_mb} МБ — swap не нужен"; return 0; fi
   free_mb=$(df -Pm / | awk 'NR==2{print $4}')
-  if [ "$free_mb" -lt 4096 ]; then warn "на диске свободно ${free_mb} МБ — swap не создаю"; return 0; fi
+  if [ -f /swapfile ]; then size_mb=0   # остался от прошлой попытки: попробуем включить его, а не создавать заново
+  elif [ "$free_mb" -ge 4096 ]; then size_mb=2048
+  elif [ "$free_mb" -ge 2048 ]; then size_mb=1024
+  else warn "на диске свободно ${free_mb} МБ — swap не создаю"; return 0; fi
   fstype=$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)
-  info "Создаю /swapfile 2 ГБ: RAM ${mem_mb} МБ, без swap ядро при нехватке памяти убивает процессы"
+  info "Swap /swapfile: RAM ${mem_mb} МБ, без swap ядро при нехватке памяти убивает процессы"
   [ "$DRY_RUN" = 1 ] && { printf '   %s[dry-run]%s fallocate/mkswap/swapon /swapfile, строка в /etc/fstab\n' "$Y" "$N"; return 0; }
-  if [ ! -f /swapfile ]; then
+  if [ "$size_mb" -gt 0 ]; then
     case "$fstype" in
-      btrfs) btrfs filesystem mkswapfile --size 2g /swapfile >/dev/null 2>&1 || { warn "не удалось создать swap на btrfs"; return 0; } ;;
-      ext4|ext3|xfs) fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none ;;
-      *) dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none ;;
+      btrfs) btrfs filesystem mkswapfile --size "${size_mb}m" /swapfile >/dev/null 2>&1 || { warn "не удалось создать swap на btrfs"; return 0; } ;;
+      ext4|ext3|xfs) fallocate -l "${size_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none ;;
+      *) dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none ;;
     esac
-    chmod 600 /swapfile
-    [ "$fstype" = btrfs ] || mkswap /swapfile >/dev/null
   fi
-  if swapon /swapfile 2>/dev/null; then
+  chmod 600 /swapfile
+  if ! swapon /swapfile 2>/dev/null && [ "$fstype" != btrfs ]; then
+    if mkswap /swapfile >/dev/null 2>&1; then swapon /swapfile 2>/dev/null || true; fi   # битый или не размеченный файл
+  fi
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -qx /swapfile; then
     grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab
-    ok "swap 2 ГБ включён"
+    ok "swap $(swapon --show=SIZE --noheadings 2>/dev/null | head -1) включён"
   else
     warn "swapon не сработал (файловая система $fstype?) — swap не включён"
   fi
@@ -312,8 +362,12 @@ setup_journald() {
 setup_time() {
   if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" = yes ]; then ok "время синхронизировано"; return 0; fi
   info "Включаю синхронизацию времени"
-  if ! systemctl is-active --quiet chrony 2>/dev/null && ! systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
-    apt_install systemd-timesyncd
+  if systemctl is-active --quiet chrony 2>/dev/null; then
+    run systemctl restart chrony || true
+  else
+    systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || apt_install systemd-timesyncd
+    run systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true   # на некоторых образах он замаскирован
+    run systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
   fi
   run timedatectl set-ntp true || warn "не удалось включить NTP"
 }
@@ -323,6 +377,19 @@ install_docker() {
   if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), compose $(docker compose version --short 2>/dev/null || echo '?')"
     run systemctl enable --now docker >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v docker >/dev/null; then  # Docker есть, а compose v2 нет: get.docker.com поверх него конфликтует с пакетами
+    info "Docker есть, но нет docker compose v2 — ставлю плагин"
+    local pkgs=(docker-compose-v2 docker-compose-plugin)
+    dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q 'install ok installed' && pkgs=(docker-compose-plugin docker-compose-v2)
+    apt_update
+    if [ "$DRY_RUN" = 1 ]; then printf '   %s[dry-run]%s apt-get install %s\n' "$Y" "$N" "${pkgs[0]}"; return 0; fi
+    wait_dpkg
+    "${APT[@]}" install "${pkgs[0]}" >/dev/null 2>&1 || "${APT[@]}" install "${pkgs[1]}" >/dev/null 2>&1 || die "не удалось установить docker compose"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    docker compose version >/dev/null 2>&1 || die "docker compose не работает"
+    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), compose $(docker compose version --short)"
     return 0
   fi
   info "Ставлю Docker"
@@ -376,11 +443,22 @@ setup_warp() {
   local i
   for i in $(seq 1 20); do warp-cli --accept-tos status >/dev/null 2>&1 && break; sleep 1; done
   warp-cli --accept-tos registration show >/dev/null 2>&1 || warp-cli --accept-tos registration new >/dev/null || { warn "WARP: регистрация не удалась"; return 0; }
-  # Сначала режим proxy, потом connect: в обычном режиме WARP заберёт весь трафик сервера, включая SSH
-  warp-cli --accept-tos mode proxy >/dev/null
-  warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null
-  warp-cli --accept-tos connect >/dev/null
-  for i in $(seq 1 30); do warp_ok && { ok "WARP работает: socks5 127.0.0.1:$WARP_PORT (warp=on)"; return 0; }; sleep 2; done
+  local try
+  for try in 1 2; do
+    # Сначала режим proxy, потом connect: в обычном режиме WARP заберёт весь трафик сервера, включая SSH
+    warp-cli --accept-tos mode proxy >/dev/null
+    warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null
+    warp-cli --accept-tos connect >/dev/null
+    for i in $(seq 1 30); do warp_ok && { ok "WARP работает: socks5 127.0.0.1:$WARP_PORT (warp=on)"; return 0; }; sleep 2; done
+    [ "$try" = 1 ] || break
+    # Частая причина на уже настроенной ноде — протухшая регистрация или зависший демон: регистрируемся заново
+    info "WARP не поднялся — перерегистрирую и перезапускаю warp-svc"
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+    systemctl restart warp-svc >/dev/null 2>&1 || true
+    for i in $(seq 1 20); do warp-cli --accept-tos status >/dev/null 2>&1 && break; sleep 1; done
+    warp-cli --accept-tos registration new >/dev/null || { warn "WARP: регистрация не удалась"; return 0; }
+  done
   warn "WARP не поднялся — проверьте: warp-cli --accept-tos status"
 }
 
@@ -446,8 +524,13 @@ check_old_hooks() {
   local f
   for f in /etc/letsencrypt/renewal-hooks/deploy/*; do
     [ -f "$f" ] || continue
-    if grep -qE "$CERT_DIR|restart +$NODE_NAME" "$f"; then
-      warn "старый хук $f тоже копирует сертификат/перезапускает ноду — удалите его, иначе нода будет перезапускаться дважды"
+    grep -qE "$CERT_DIR|restart +$NODE_NAME" "$f" || continue
+    if grep -vE '^[[:space:]]*#' "$f" | grep -qiE 'nginx|apache|httpd|haproxy|caddy|angie|hestia|reload'; then
+      warn "старый хук $f копирует сертификат ноды, но делает и другое (веб-сервер?) — не трогаю; уберите из него копирование в $CERT_DIR и перезапуск ноды"
+    else
+      info "Старый хук $f дублирует наш (нода перезапускалась бы дважды) — переношу в $HOOK_DIR/disabled/"
+      run install -d -m 755 "$HOOK_DIR/disabled"
+      run mv "$f" "$HOOK_DIR/disabled/"
     fi
   done
 }
@@ -533,7 +616,7 @@ parse_compose_text() {  # из compose/ключа панели берём SECRET
       k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
       v=${v%"${v##*[![:space:]]}"}; v=${v%\"}; v=${v%\'}; v=${v#\"}; v=${v#\'}
       case "$k" in
-        SECRET_KEY) key_found=$v ;;
+        SECRET_KEY|SSL_CERT) key_found=$v ;;   # SSL_CERT — так ключ назывался в старых версиях ноды
         NODE_PORT|APP_PORT) port=$v ;;
         *) ENV_EXTRA+=("$k=$v") ;;
       esac
@@ -569,6 +652,28 @@ EOF
   rm -f "$tmp"
 }
 
+env_as_list() {  # строки KEY=VAL из .env в вид «- KEY=VAL», который понимает parse_compose_text
+  [ -r "$1" ] || return 0
+  sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Z_][A-Z0-9_]*=)/- \2/' "$1"
+}
+
+existing_node_container() {  # контейнер ноды, если он уже есть: сначала наш, потом любой из образа remnawave/node
+  if docker inspect "$NODE_NAME" >/dev/null 2>&1; then echo "$NODE_NAME"; return 0; fi
+  docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | awk -F'\t' '$2 ~ /remnawave\/node/ {print $1; exit}'
+}
+
+existing_node_text() {  # ключ, порт и прочее из уже настроенной ноды, развёрнутой не этим скриптом
+  local c wd files f
+  command -v docker >/dev/null || return 0
+  c=$(existing_node_container); [ -n "$c" ] || return 0
+  wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$c" 2>/dev/null || true)
+  files=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$c" 2>/dev/null || true)
+  for f in ${files//,/ }; do [ -r "$f" ] && cat "$f"; done
+  [ -n "$wd" ] && env_as_list "$wd/.env"
+  # из переменных контейнера — только ключ и порт, остальное там от образа (PATH и т.п.)
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null | grep -E '^(SECRET_KEY|SSL_CERT|NODE_PORT|APP_PORT)=' | sed 's/^/- /'
+}
+
 get_secret_key() {
   local raw="" src=""
   if [ -n "$SECRET_KEY_FILE" ]; then
@@ -576,8 +681,10 @@ get_secret_key() {
     raw=$(cat "$SECRET_KEY_FILE"); src="файл $SECRET_KEY_FILE"
   elif [ -n "$SECRET_KEY" ]; then
     raw="SECRET_KEY=$SECRET_KEY"; src="переменная SECRET_KEY"
-  elif [ -f "$COMPOSE" ] && [ "$NEW_KEY" = 0 ]; then
-    raw=$(cat "$COMPOSE"); src="из $COMPOSE; другой ключ — --new-key"
+  elif [ -f "$COMPOSE" ] && [ "$NEW_KEY" = 0 ] && parse_compose_text "$(cat "$COMPOSE"; env_as_list "$NODE_DIR/.env")"; then
+    raw=$(cat "$COMPOSE"; env_as_list "$NODE_DIR/.env"); src="из $COMPOSE; другой ключ — --new-key"
+  elif [ "$NEW_KEY" = 0 ] && parse_compose_text "$(existing_node_text)"; then
+    raw=$(existing_node_text); src="из уже запущенной ноды ($(existing_node_container)); другой ключ — --new-key"
   elif have_tty; then
     info "Нужен ключ ноды из панели: Ноды → добавить ноду → скопируйте docker-compose.yml. Сейчас откроется редактор."
     ask "Нажмите Enter, чтобы открыть редактор…" _unused ""
@@ -636,19 +743,36 @@ node_xray_config() {  # JSON работающего Xray ноды (появля�
   curl -fsS -m 5 --abstract-unix-socket "$sock" "http://localhost/internal/get-config?token=$tok" 2>/dev/null
 }
 
-check_inbounds() {
-  local cfg tag port net proto l4 who
-  cfg=$(node_xray_config) || { info "Xray ноды ещё не запущен панелью — порты инбаундов проверю позже: bash install.sh status"; return 0; }
-  info "Инбаунды из профиля панели"
+inbound_rows() {  # tag, порт, l4, кто слушает — по инбаундам работающего Xray
+  local cfg tag port net proto l4
+  cfg=$(node_xray_config) || return 1
   while IFS=$'\t' read -r tag port net proto; do
     [ -n "$port" ] || continue
     l4=tcp
     case "$proto/$net" in hysteria*|*/hysteria|*/kcp|*/quic|wireguard/*) l4=udp ;; esac
-    who=$(port_owner "$l4" "${port%%-*}")
-    if [ -z "$who" ]; then warn "инбаунд «$tag» ($port/$l4) не слушается — Xray не смог занять порт? Смотрите логи ноды"
-    elif [[ ! "$who" =~ (rw-core|xray) ]]; then warn "порт $port/$l4 инбаунда «$tag» занят процессом $who, а не Xray"
-    else ok "$tag: $port/$l4"; fi
+    printf '%s\t%s\t%s\t%s\n' "$tag" "$port" "$l4" "$(port_owner "$l4" "${port%%-*}")"
   done < <(jq -r '.inbounds[]? | select(.port != null) | [.tag, (.port|tostring), (.streamSettings.network // "tcp"), .protocol] | @tsv' <<<"$cfg" 2>/dev/null)
+}
+
+check_inbounds() {  # check_inbounds [fix]: с fix перезапускает ноду, если Xray не занял свободный порт
+  local rows tag port l4 who i
+  rows=$(inbound_rows) || { info "Xray ноды ещё не запущен панелью — порты инбаундов проверю позже: bash install.sh status"; return 0; }
+  if [ "${1:-}" = fix ] && [ "$DRY_RUN" = 0 ] && awk -F'\t' '$2 != "" && $4 == "" {f=1} END {exit !f}' <<<"$rows"; then
+    # обычно порт на старте был занят чьим-то исходящим соединением; теперь он в резерве и свободен
+    info "часть инбаундов не слушается, хотя порты свободны — перезапускаю ноду"
+    docker restart "$NODE_NAME" >/dev/null 2>&1 || true
+    sleep 5
+    # после перезапуска Xray стартует, когда панель снова отдаст профиль
+    for i in $(seq 1 45); do rows=$(inbound_rows) && ! awk -F'\t' '$2 != "" && $4 == "" {f=1} END {exit !f}' <<<"$rows" && break; sleep 2; done
+    rows=$(inbound_rows) || { warn "после перезапуска панель ещё не запустила Xray — проверьте позже: bash install.sh status"; return 0; }
+  fi
+  info "Инбаунды из профиля панели"
+  while IFS=$'\t' read -r tag port l4 who; do
+    [ -n "$port" ] || continue
+    if [ -z "$who" ]; then warn "инбаунд «$tag» ($port/$l4) не слушается — Xray не смог занять порт? Смотрите логи ноды"
+    elif [[ ! "$who" =~ (rw-core|xray) ]]; then warn "порт $port/$l4 инбаунда «$tag» занят процессом $who, а не Xray: освободите порт или смените его в профиле"
+    else ok "$tag: $port/$l4"; fi
+  done <<<"$rows"
 }
 
 wait_node() {
@@ -683,6 +807,12 @@ setup_node() {
     warn "контейнер $NODE_NAME был создан не из $NODE_DIR (${wd:-вручную}) — пересоздаю"
     run docker rm -f "$NODE_NAME" >/dev/null
   fi
+  local other
+  for other in $(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | awk -F'\t' -v n="$NODE_NAME" '$2 ~ /remnawave\/node/ && $1 != n {print $1}'); do
+    # вторая нода в host-сети держит тот же порт, и наша не поднимется (ключ из неё уже взят)
+    info "Найден ещё один контейнер ноды «$other» (не из $NODE_DIR) — удаляю, иначе он мешает нашему"
+    run docker rm -f "$other" >/dev/null
+  done
   info "Скачиваю образ и запускаю ноду"
   local n
   for n in 1 2 3; do run docker compose -f "$COMPOSE" pull -q && break; warn "docker pull: попытка $n не удалась"; sleep 5; done
@@ -699,8 +829,8 @@ post_node_checks() {
   [ "$DRY_RUN" = 1 ] && return 0
   local i
   for i in $(seq 1 15); do node_xray_config >/dev/null && break; sleep 2; done
-  check_inbounds
   if [ "$IS_CONTAINER" = 0 ] && [ -n "$(inbound_ports_from_node)" ]; then write_sysctl; apply_sysctl >/dev/null; fi
+  check_inbounds fix
   open_ports_if_firewall_active
 }
 
@@ -862,6 +992,7 @@ summary() {
   if [ "${#WARNINGS[@]}" -gt 0 ]; then
     printf '%sПредупреждения (%d):%s\n' "$Y" "${#WARNINGS[@]}" "$N"
     printf '  - %s\n' "${WARNINGS[@]}"
+    if [ "$CMD" = status ]; then printf '\nИсправить: bash install.sh -y — на уже настроенной ноде ключ, порт и домен берутся из текущей установки\n'; fi
   else
     ok "готово, предупреждений нет"
   fi
