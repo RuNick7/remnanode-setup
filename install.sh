@@ -7,10 +7,11 @@
 # install: ждёт освобождения apt, ставит Docker (с запасным путём для новых Ubuntu), настраивает ядро
 # (BBR, буферы QUIC/HY2, conntrack, резерв портов сервисов), swap, лимит журналов, синхронизацию
 # времени, Cloudflare WARP в режиме proxy, сертификат Let's Encrypt с продлением, которому не мешает
-# занятый 80-й порт, и саму ноду (compose из панели + volumes + ротация логов).
+# занятый 80-й порт, и саму ноду (compose из панели + volumes + ротация логов), а рядом с ней
+# vpncheck-agent: он отдаёт admin_bot строки логов Xray этой ноды для проверок серверов из поддержки.
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 NODE_DIR="/opt/remnanode"
 COMPOSE="$NODE_DIR/docker-compose.yml"
 NODE_NAME="remnanode"
@@ -19,6 +20,12 @@ CERT_DIR="/etc/certs/remna"
 HOOK_DIR="/usr/local/lib/remnanode-setup"
 SYSCTL_FILE="/etc/sysctl.d/60-remnanode.conf"
 LOG_FILE="/var/log/remnanode-setup.log"
+XRAY_LOG_DIR="/var/log/remnanode"   # сюда Xray ноды пишет access.log/error.log (если так задано в профиле), отсюда их читает агент
+AGENT_BIN="/usr/local/bin/vpncheck-agent"
+AGENT_UNIT="/etc/systemd/system/vpncheck-agent.service"
+AGENT_DATA="/var/lib/vpncheck-agent"
+AGENT_PORT=7443
+AGENT_RELEASES="https://github.com/RuNick7/vpn-check/releases/latest/download"
 
 CMD="install"
 DOMAIN=""
@@ -38,6 +45,11 @@ FIREWALL=0
 PANEL_IP=""
 INBOUND_PORTS=""
 FOLLOW_LOGS=1
+AGENT=1
+AGENT_NAME=""
+AGENT_PUBLIC=""
+BOT_IP=""
+AGENT_LINE=""
 DRY_RUN=0
 ASSUME_YES=0
 ACME_PORT=""
@@ -66,7 +78,7 @@ remnanode-setup $VERSION — нода Remnawave на Ubuntu с нуля
   install   (по умолчанию) полная установка/донастройка; безопасно запускать повторно
   cert      выпустить/починить сертификат для HY2/TLS и его автопродление (нужен --domain)
   status    проверка: нода, инбаунды, WARP, сертификаты, ядро, память, диск (ничего не меняет)
-  update    обновить образ ноды и перезапустить её
+  update    обновить образ ноды и vpncheck-agent, перезапустить их
 
 Опции:
   --domain fl6.example.com   домен ноды для сертификата Let's Encrypt (HY2 и другие TLS-инбаунды)
@@ -80,6 +92,10 @@ remnanode-setup $VERSION — нода Remnawave на Ubuntu с нуля
   --no-swap                  не создавать swap
   --firewall                 включить ufw: SSH, 80, 443, инбаунды; порт ноды — только для --panel-ip
   --panel-ip 1.2.3.4         IP панели Remnawave (для --firewall)
+  --no-agent                 не ставить vpncheck-agent (логи ноды для проверок серверов из поддержки)
+  --agent-name de15          имя ноды в NODE_LOG_AGENTS (по умолчанию первая часть домена или имя хоста)
+  --agent-public ADDR        адрес, по которому admin_bot достучится до агента (по умолчанию домен или IP)
+  --bot-ip 1.2.3.4           IP сервера бота: если ufw включён, порт агента $AGENT_PORT открывается только ему
   --no-logs                  не открывать логи ноды в конце установки
   --dry-run                  показать, что будет сделано, ничего не меняя
   -y, --yes                  ничего не спрашивать (ключ тогда через SECRET_KEY=... или --secret-key-file)
@@ -216,6 +232,7 @@ reserved_ports() {  # порты сервисов, которые ядро не 
   list+=("${NODE_PORT:-${NODE_PORT_ARG:-2222}}")
   [ "$WARP" = 1 ] && list+=("$WARP_PORT")
   [ -n "$ACME_PORT" ] && list+=("$ACME_PORT")
+  [ "$AGENT" = 1 ] && list+=("$AGENT_PORT")
   for p in ${INBOUND_PORTS//,/ }; do list+=("${p%%/*}"); done
   for p in $(inbound_ports_from_node); do list+=("$p"); done
   if [ -f "$SYSCTL_FILE" ]; then  # не терять порты, сохранённые прошлыми запусками
@@ -623,7 +640,7 @@ parse_compose_text() {  # из compose/ключа панели берём SECRET
     elif [[ $line =~ ^[[:space:]]*image:[[:space:]]*[\"\']?([^\"\'[:space:]]+) ]]; then
       NODE_IMAGE=${BASH_REMATCH[1]}
     elif [[ $line =~ ^[[:space:]]*-[[:space:]]*[\"\']?(/[^:\"\']+:/[^\"\']+)[\"\']?[[:space:]]*$ ]]; then
-      [ "${BASH_REMATCH[1]}" = "$CERT_DIR:$CERT_DIR:ro" ] || VOL_EXTRA+=("${BASH_REMATCH[1]}")
+      case "${BASH_REMATCH[1]}" in "$CERT_DIR:$CERT_DIR:ro"|"$XRAY_LOG_DIR:"*) ;; *) VOL_EXTRA+=("${BASH_REMATCH[1]}") ;; esac
     fi
   done <<<"$1"
   if [ -z "$key_found" ]; then  # вставили только сам ключ
@@ -721,7 +738,7 @@ services:
       - SECRET_KEY="$SECRET_KEY"
 EOF
   for e in "${ENV_EXTRA[@]}"; do printf '      - %s\n' "$e"; done
-  printf '    volumes:\n      - %s:%s:ro\n' "$CERT_DIR" "$CERT_DIR"
+  printf '    volumes:\n      - %s:%s:ro\n      - %s:%s\n' "$CERT_DIR" "$CERT_DIR" "$XRAY_LOG_DIR" "$XRAY_LOG_DIR"
   for v in "${VOL_EXTRA[@]}"; do printf '      - %s\n' "$v"; done
   cat <<'EOF'
     logging:
@@ -791,7 +808,9 @@ setup_node() {
     who=$(port_owner tcp "$NODE_PORT")
     case "$who" in rw-node|node|"") ;; *) die "порт ноды $NODE_PORT занят ($who). Освободите его или задайте --node-port (тот же порт укажите в панели)" ;; esac
   fi
-  run install -d -m 755 "$NODE_DIR" "$CERT_DIR"
+  run install -d -m 755 "$NODE_DIR" "$CERT_DIR" "$XRAY_LOG_DIR"
+  # access.log растёт с трафиком: раз в сутки, одна старая копия — её (access.log.1) vpncheck-agent тоже читает
+  printf '%s/*.log {\n    daily\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n}\n' "$XRAY_LOG_DIR" | write_file /etc/logrotate.d/remnanode 644
   local new changed=0
   new=$(render_compose)
   # строка с датой в шапке не считается изменением
@@ -870,6 +889,121 @@ setup_firewall() {
   ok "ufw включён (SSH: $(echo "$sshp" | paste -sd, -))"
 }
 
+# ---------- vpncheck-agent ----------
+# Отдаёт admin_bot строки логов Xray этой ноды за время проверки серверов, которую клиент прислал в поддержку.
+# Отвечает только по TLS со своим самоподписанным сертификатом и только своему токену; оба лежат в $AGENT_DATA
+# и переживают переустановку, поэтому строка для NODE_LOG_AGENTS при повторных запусках не меняется.
+agent_unit_flag() { [ -f "$AGENT_UNIT" ] && sed -nE "s/^ExecStart=.* -$1 ([^ ]+).*/\1/p" "$AGENT_UNIT" | head -1; return 0; }
+
+agent_unit() {
+  cat <<EOF
+# Создано remnanode-setup: bash install.sh -y обновляет агента и этот файл
+[Unit]
+Description=vpncheck-agent: node logs for support tickets
+After=network-online.target
+
+[Service]
+ExecStart=$AGENT_BIN -name $AGENT_NAME -public $AGENT_PUBLIC -listen :$AGENT_PORT -log $XRAY_LOG_DIR/access.log -log $XRAY_LOG_DIR/error.log
+DynamicUser=yes
+StateDirectory=vpncheck-agent
+# Xray создаёт логи от root с правами 0600: это позволяет агенту их читать и больше ничего из прав root
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+agent_health() {  # JSON /v1/health работающего агента: какие логи он видит
+  [ -r "$AGENT_DATA/token" ] || return 1
+  curl -fsSk -m 5 -H "Authorization: Bearer $(cat "$AGENT_DATA/token")" "https://127.0.0.1:$AGENT_PORT/v1/health" 2>/dev/null
+}
+
+check_xray_logs() {  # профиль панели должен писать логи Xray в файлы, которые видит агент
+  local cfg access health
+  cfg=$(node_xray_config) || { info "Xray ноды ещё не запущен панелью — куда он пишет логи, проверю позже: bash install.sh status"; return 0; }
+  access=$(jq -r '.log.access // ""' <<<"$cfg" 2>/dev/null || true)
+  if [ "$access" != "$XRAY_LOG_DIR/access.log" ]; then
+    warn "Xray пишет access-лог в «${access:-никуда}», а агент читает $XRAY_LOG_DIR/access.log. В панели, в профиле ноды, задайте: \"log\": {\"loglevel\": \"warning\", \"access\": \"$XRAY_LOG_DIR/access.log\", \"error\": \"$XRAY_LOG_DIR/error.log\"}"
+    return 0
+  fi
+  health=$(agent_health) || { warn "vpncheck-agent не ответил на https://127.0.0.1:$AGENT_PORT — journalctl -u vpncheck-agent -n 20"; return 0; }
+  local bad; bad=$(jq -r '.files[]? | select(.error) | .error' <<<"$health" 2>/dev/null || true)
+  if [ -n "$bad" ]; then while IFS= read -r line; do warn "vpncheck-agent не читает $line"; done <<<"$bad"
+  else ok "vpncheck-agent видит логи Xray: $(jq -r '[.files[]? | "\(.path | split("/") | last) \(.size / 1048576 | floor) МБ"] | join(", ")' <<<"$health")"; fi
+}
+
+setup_agent() {
+  [ "$AGENT" = 1 ] || return 0
+  info "vpncheck-agent: логи ноды для проверок серверов из поддержки"
+  local asset tmp want cur changed=0 who
+  case "$ARCH" in amd64|arm64) asset="vpncheck-agent-linux-$ARCH" ;; *) warn "vpncheck-agent нет под $ARCH — пропускаю"; return 0 ;; esac
+  AGENT_NAME=${AGENT_NAME:-$(agent_unit_flag name)}
+  AGENT_NAME=${AGENT_NAME:-${DOMAIN%%.*}}
+  AGENT_NAME=${AGENT_NAME:-$(hostname -s)}
+  AGENT_PUBLIC=${AGENT_PUBLIC:-$(agent_unit_flag public)}
+  AGENT_PUBLIC=${AGENT_PUBLIC:-$DOMAIN}
+  AGENT_PUBLIC=${AGENT_PUBLIC:-$(public_ip4)}
+  [[ $AGENT_NAME =~ ^[A-Za-z0-9._-]+$ ]] || { warn "имя ноды для агента «$AGENT_NAME» не годится — задайте --agent-name"; return 0; }
+  [ -n "$AGENT_PUBLIC" ] || { warn "не знаю адрес ноды для агента — задайте --agent-public (домен или IP)"; return 0; }
+  if port_busy tcp "$AGENT_PORT"; then
+    who=$(port_owner tcp "$AGENT_PORT")
+    case "$who" in vpncheck-agent|"") ;; *) warn "порт $AGENT_PORT занят ($who) — vpncheck-agent не ставлю"; return 0 ;; esac
+  fi
+
+  # бинарник из последнего релиза github.com/RuNick7/vpn-check, сверенный с его SHA256SUMS
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '   %s[dry-run]%s скачать %s/%s, сверить с SHA256SUMS, установить в %s\n' "$Y" "$N" "$AGENT_RELEASES" "$asset" "$AGENT_BIN"
+  else
+    tmp=$(mktemp -d)
+    if curl -fsSL --retry 3 -m 120 -o "$tmp/$asset" "$AGENT_RELEASES/$asset" && curl -fsSL --retry 3 -m 30 -o "$tmp/SHA256SUMS" "$AGENT_RELEASES/SHA256SUMS"; then
+      want=$(awk -v f="$asset" '$2 == f {print $1}' "$tmp/SHA256SUMS")
+      if [ -z "$want" ] || [ "$(sha256sum "$tmp/$asset" | cut -d' ' -f1)" != "$want" ]; then
+        warn "скачанный $asset не совпал с SHA256SUMS релиза — не ставлю"
+      else
+        cur=$(sha256sum "$AGENT_BIN" 2>/dev/null | cut -d' ' -f1 || true)
+        if [ "$cur" = "$want" ]; then ok "$AGENT_BIN — последняя версия"
+        else install -m 755 "$tmp/$asset" "$AGENT_BIN"; changed=1; if [ -n "$cur" ]; then ok "$AGENT_BIN обновлён"; else ok "$AGENT_BIN установлен"; fi; fi
+      fi
+    else
+      if [ -x "$AGENT_BIN" ]; then warn "не скачался $asset с github.com/RuNick7/vpn-check — остаётся прежняя версия"
+      else warn "не скачался $asset с github.com/RuNick7/vpn-check — агент не установлен, повторите bash install.sh -y"; fi
+    fi
+    rm -rf "$tmp"
+    [ -x "$AGENT_BIN" ] || return 0
+  fi
+
+  if [ "$(cat "$AGENT_UNIT" 2>/dev/null)" != "$(agent_unit)" ]; then
+    agent_unit | write_file "$AGENT_UNIT" 644
+    run systemctl daemon-reload
+    changed=1
+  fi
+  if [ "$changed" = 1 ]; then run systemctl enable vpncheck-agent >/dev/null 2>&1; run systemctl restart vpncheck-agent
+  else run systemctl enable --now vpncheck-agent >/dev/null 2>&1; fi
+  [ "$DRY_RUN" = 1 ] && return 0
+
+  local i
+  for i in $(seq 1 10); do [ -s "$AGENT_DATA/token" ] && port_busy tcp "$AGENT_PORT" && break; sleep 1; done
+  if ! systemctl is-active --quiet vpncheck-agent || [ ! -s "$AGENT_DATA/token" ]; then
+    warn "vpncheck-agent не запустился — journalctl -u vpncheck-agent -n 20"; return 0
+  fi
+  ok "vpncheck-agent работает: $AGENT_NAME, https://$AGENT_PUBLIC:$AGENT_PORT"
+  AGENT_LINE=$("$AGENT_BIN" -print -name "$AGENT_NAME" -public "$AGENT_PUBLIC" -listen ":$AGENT_PORT" -data "$AGENT_DATA" 2>/dev/null || true)
+
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    if [ -n "$BOT_IP" ]; then run ufw allow from "$BOT_IP" to any port "$AGENT_PORT" proto tcp comment 'vpncheck-agent' >/dev/null
+      ok "ufw: порт $AGENT_PORT открыт для $BOT_IP"
+    elif ! ufw status 2>/dev/null | grep -qE "^$AGENT_PORT(/tcp)?[[:space:]]"; then
+      warn "ufw закрывает порт агента $AGENT_PORT — откройте его серверу бота: bash install.sh -y --bot-ip <IP сервера бота>"
+    fi
+  else
+    info "ufw выключен: порт $AGENT_PORT доступен всем, агент отвечает только по TLS и своему токену. Закрыть для всех, кроме бота: --firewall --panel-ip <IP панели> --bot-ip <IP бота>"
+  fi
+  check_xray_logs
+}
+
 # ---------- команды ----------
 collect_inputs() {
   get_secret_key
@@ -901,6 +1035,7 @@ cmd_install() {
   setup_node
   post_node_checks
   setup_firewall
+  setup_agent
 }
 
 cmd_cert() {
@@ -919,6 +1054,7 @@ cmd_update() {
   run docker image prune -f >/dev/null
   wait_node
   post_node_checks
+  if [ -f "$AGENT_UNIT" ]; then setup_agent; fi
 }
 
 cmd_status() {
@@ -938,6 +1074,15 @@ cmd_status() {
     grep -q 'max-size' "$COMPOSE" || warn "у контейнера нет ротации логов (logging max-size)"
   fi
   check_inbounds
+
+  info "vpncheck-agent"
+  if [ -f "$AGENT_UNIT" ]; then
+    if systemctl is-active --quiet vpncheck-agent; then ok "служба работает: $(agent_unit_flag name), https://$(agent_unit_flag public):$AGENT_PORT"
+    else warn "vpncheck-agent установлен, но не работает — journalctl -u vpncheck-agent -n 20; bash install.sh -y"; fi
+    check_xray_logs
+  else
+    warn "vpncheck-agent не установлен — без него в поддержку не приходят логи этой ноды: bash install.sh -y"
+  fi
 
   info "WARP"
   if command -v warp-cli >/dev/null; then
@@ -1005,6 +1150,13 @@ summary() {
   - проверка всего: bash $0 status
 EOF
   fi
+  if [ -n "$AGENT_LINE" ]; then
+    cat <<EOF
+
+vpncheck-agent: строка этой ноды для NODE_LOG_AGENTS в .env бота (строки нод — через запятую, без пробелов):
+  $AGENT_LINE
+EOF
+  fi
 }
 
 parse_args() {
@@ -1022,6 +1174,10 @@ parse_args() {
       --no-swap) SWAP=0; shift ;;
       --firewall) FIREWALL=1; shift ;;
       --panel-ip) PANEL_IP=${2:-}; shift 2 ;;
+      --no-agent) AGENT=0; shift ;;
+      --agent-name) AGENT_NAME=${2:-}; shift 2 ;;
+      --agent-public) AGENT_PUBLIC=${2:-}; shift 2 ;;
+      --bot-ip) BOT_IP=${2:-}; shift 2 ;;
       --no-logs) FOLLOW_LOGS=0; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -y|--yes) ASSUME_YES=1; shift ;;
@@ -1032,6 +1188,9 @@ parse_args() {
   [[ $WARP_PORT =~ ^[0-9]+$ ]] || die "неверный --warp-port"
   if [ -n "$NODE_PORT_ARG" ] && ! [[ $NODE_PORT_ARG =~ ^[0-9]+$ ]]; then die "неверный --node-port"; fi
   if [ -n "$PANEL_IP" ] && ! [[ $PANEL_IP =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]]; then die "неверный --panel-ip"; fi
+  if [ -n "$BOT_IP" ] && ! [[ $BOT_IP =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]]; then die "неверный --bot-ip"; fi
+  if [ -n "$AGENT_NAME" ] && ! [[ $AGENT_NAME =~ ^[A-Za-z0-9._-]+$ ]]; then die "неверный --agent-name (буквы, цифры, . _ -)"; fi
+  if [ -n "$AGENT_PUBLIC" ] && ! [[ $AGENT_PUBLIC =~ ^[A-Za-z0-9.:-]+$ ]]; then die "неверный --agent-public"; fi
   return 0
 }
 
