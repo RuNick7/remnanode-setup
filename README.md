@@ -53,9 +53,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/RuNick7/remnanode-setup/main
 | `install` (по умолчанию) | полная установка или донастройка |
 | `cert --domain X` | выпустить или починить сертификат и его автопродление, например на уже работающей ноде |
 | `status` | проверка: нода, порты инбаундов, WARP, сертификаты, ядро, память, диск. Ничего не меняет; исправляет `install -y` |
-| `update` | обновить образ ноды и перезапустить её |
+| `update` | обновить образ ноды и vpncheck-agent, перезапустить их |
 
-Опции: `--domain`, `--email`, `--secret-key-file FILE`, `--new-key`, `--node-port`, `--inbound-ports "443/tcp,9997/udp"`, `--no-warp`, `--warp-port`, `--no-swap`, `--firewall --panel-ip IP`, `--no-logs`, `--dry-run`, `-y`. Подробности: `bash install.sh --help`.
+Опции: `--domain`, `--email`, `--secret-key-file FILE`, `--new-key`, `--node-port`, `--inbound-ports "443/tcp,9997/udp"`, `--no-warp`, `--warp-port`, `--no-swap`, `--firewall --panel-ip IP`, `--bot-ip IP`, `--agent-name`, `--agent-public`, `--no-agent`, `--no-logs`, `--dry-run`, `-y`. Подробности: `bash install.sh --help`.
 
 ## Что делает `install` и зачем
 
@@ -72,6 +72,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/RuNick7/remnanode-setup/main
 | NTP | синхронизация времени |
 | Сверка портов инбаундов из профиля с тем, что реально слушается | ловит «порт занят другим процессом» и «Xray не смог открыть порт» |
 | Если ufw уже включён, открывает порт ноды и инбаунды | частая причина статуса «нода offline» после установки |
+| Монтирует `/var/log/remnanode` в ноду, ротирует логи Xray там раз в сутки | логи Xray на хосте, откуда их читает vpncheck-agent |
+| vpncheck-agent из последнего релиза [vpn-check](https://github.com/RuNick7/vpn-check) как служба systemd на порту 7443 | по проверке серверов, которую клиент прислал в поддержку, admin_bot получает строки логов этой ноды |
 
 ### Сертификат и порт 80
 
@@ -96,6 +98,22 @@ bash install.sh cert --domain fl1.example.com
 certbot renew --dry-run
 ```
 
+## vpncheck-agent (логи ноды для поддержки)
+
+`install` ставит агента на каждую ноду, повторный запуск обновляет его до последнего релиза и ничего больше не меняет. Чтобы поставить его на все уже работающие ноды, достаточно на каждой:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/RuNick7/remnanode-setup/main/install.sh) -y --bot-ip <IP сервера бота>
+```
+
+- Бинарник берётся из последнего релиза github.com/RuNick7/vpn-check и сверяется с его `SHA256SUMS`. Если он не изменился, служба не перезапускается.
+- Имя ноды (`-name`) — первая часть домена (`de15.example.com` → `de15`) или имя хоста; адрес — домен или публичный IP. При повторных запусках они берутся из уже установленной службы; поменять: `--agent-name`, `--agent-public`.
+- Токен и сертификат агента лежат в `/var/lib/vpncheck-agent` и не пересоздаются, поэтому строка ноды для бота остаётся прежней. Скрипт печатает её в конце: все строки складываются в `NODE_LOG_AGENTS` в `.env` бота через запятую.
+- Порт 7443 нужен только серверу бота. Если ufw включён, `--bot-ip` открывает его только этому IP. Без ufw порт открыт всем, но агент отвечает только по TLS и своему токену.
+- Xray должен писать логи в файлы: в панели, в профиле ноды, секция `"log": {"loglevel": "warning", "access": "/var/log/remnanode/access.log", "error": "/var/log/remnanode/error.log"}`. Скрипт и `status` проверяют это и что агент логи видит.
+- На ноде, поднятой прошлой версией скрипта, первый запуск добавит в compose том `/var/log/remnanode` и один раз пересоздаст контейнер ноды.
+- Не нужен агент: `--no-agent`.
+
 ## Firewall
 
 По умолчанию скрипт firewall не включает, чтобы случайно не закрыть доступ к серверу. С `--firewall --panel-ip <IP панели>` он включает ufw: SSH (порт берётся из `sshd -T`), 80, 443, порты инбаундов, а порт ноды открывает только для IP панели. Если у провайдера есть свой firewall (security group), порты нужно открыть и там.
@@ -111,6 +129,9 @@ certbot renew --dry-run
 /etc/systemd/journald.conf.d/60-remnanode.conf
 /swapfile                                    если swap не было
 /var/log/remnanode-setup.log                 лог всех запусков скрипта
+/var/log/remnanode/, /etc/logrotate.d/remnanode   логи Xray ноды и их ротация
+/usr/local/bin/vpncheck-agent, /etc/systemd/system/vpncheck-agent.service
+/var/lib/vpncheck-agent/                     токен и сертификат агента (не удалять: от них зависит строка в NODE_LOG_AGENTS)
 ```
 
 ## Если что-то не так
